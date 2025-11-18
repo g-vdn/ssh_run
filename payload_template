@@ -1,0 +1,141 @@
+# Payload template for ssh_run.sh
+#
+# This script is streamed to each target system and executed as root through:
+#   cat payload | ssh target "sudo su -"
+#
+# This template is modular. You may use it fully, partially, or not at all.
+# ssh_run only evaluates the final exit code:
+#   0   → SUCCESS
+#   >0  → FAILED
+#
+# Optional components:
+#
+# 1) Interpreter enforcement (ensure_bash)
+#    Use this if you require Bash-specific features (arrays, [[ ]], expansions).
+#    If your payload is POSIX-compatible, you may remove this entirely.
+#
+# 2) Manual-run style evidence (run_manual_commands)
+#    Use this if you want output to look like an operator typing commands
+#    interactively on the target system. This improves audit readability.
+#
+# If you do not use either function, you may simply write your commands after
+# the set -euo pipefail line and they will run as-is under sudo su - on target.
+# Be aware that without enforcing Bash, interpretation depends on the default
+# shell on AIX/Linux, which may differ.
+
+###########################################
+# Enforce Bash >= 4
+###########################################
+
+ensure_bash() {
+    MIN_MAJOR=4
+
+    # prevent recursion
+    [ -n "${ENSURE_BASH_DONE:-}" ] && return 0
+
+    # Already in bash?
+    if [ -n "${BASH_VERSINFO[0]:-}" ]; then
+        [ "${BASH_VERSINFO[0]}" -lt "$MIN_MAJOR" ] &&
+            { printf 'ERROR: bash >= %s required (current: %s)\n' "$MIN_MAJOR" "${BASH_VERSINFO[0]}" >&2; exit 2; }
+        export ENSURE_BASH_DONE=1
+        return 0
+    fi
+
+    # Not in bash → find one
+    for C in \
+		"$(command -v bash 2>/dev/null)" \
+		/opt/freeware/bin/bash \
+		/usr/bin/bash \
+		/bin/bash; do
+			[ -x "$C" ] || continue
+			V="$("$C" -c 'echo ${BASH_VERSINFO[0]:-0}' 2>/dev/null || echo 0)"
+			[ "$V" -ge "$MIN_MAJOR" ] || continue
+
+			export ENSURE_BASH_DONE=1
+
+			# file mode vs stdin mode
+			if [ -n "${0:-}" ] && [ -f "$0" ]; then
+				exec "$C" --noprofile --norc "$0" "$@"
+			else
+				exec "$C" --noprofile --norc -s -- "$@"
+			fi
+    done
+
+    printf 'ERROR: bash >= %s not found.\n' "$MIN_MAJOR" >&2
+    exit 2
+}
+
+ensure_bash "$@"
+
+###########################################
+# Standard environment
+###########################################
+set -euo pipefail
+
+###########################################
+# Optional: Manual-run style evidence
+# Use ONLY if you want interactive-looking logs.
+###########################################
+run_manual_commands() {
+	local RC=0
+
+	cmd_prompt() {
+		local user host cwd sym
+		user="$(whoami)"
+		host="$(hostname -s)"
+		cwd="$(pwd)"
+		sym="$([[ $user == root ]] && echo '#' || echo '$')"
+
+		printf '%s %s@%s:%s %s' \
+			"$(date '+%H:%M:%S %Z')" \
+			"$user" "$host" "$cwd" "$sym"
+	}
+
+	# COMMANDS array must be defined by user before calling this function
+	for cmd in "${COMMANDS[@]}"; do
+		printf '%s %s\n' "$(cmd_prompt)" "$cmd"
+		if ! bash -c "$cmd"; then
+			RC=1
+		fi
+	done
+
+	return "$RC"
+}
+
+###########################################
+# User logic goes below (optional)
+#
+# IMPORTANT:
+# - COMMANDS[] is ONLY for manual-emulation mode.
+#   If you don't call run_manual_commands, do NOT define COMMANDS[].
+#
+# - Manual emulation mode (optional):
+#       • Define COMMANDS[]
+#       • Call run_manual_commands
+#       • Capture the returned exit code with: RC=$?
+#       • Forward it explicitly if needed: exit $RC
+#
+# - Direct execution mode (default):
+#       • Do NOT define COMMANDS[]
+#       • Write your shell code directly under set -euo pipefail
+#       • Whatever exit code your code produces will be returned
+#         to ssh_run, which determines PASS/FAIL automatically.
+#
+# You do NOT need to call "exit" unless you want to override
+# the exit status of your direct logic. ssh_run will read it.
+###########################################
+
+# --- Manual emulation mode example ---
+# COMMANDS=(
+#     "uname -a"
+#     "df -h"
+# )
+# run_manual_commands
+# RC="$?"
+# exit $RC # optional; forward the emulation exit code
+
+# --- Direct execution example ---
+# echo "Running my checks..."
+# uptime
+# some_command_that_might_fail
+# (no 'exit' needed — ssh_run reads shell’s exit code)
