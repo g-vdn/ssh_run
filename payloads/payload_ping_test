@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+
+# ===============================================================================
+# payload_ping_test
+# -------------------------------------------------------------------------------
+# Author : George Vaideanu
+# Contact: george@vaideanu.ro
+# Version: 1.0
+# Summary: Validates connectivity to predefined targets on AIX and Linux hosts
+#          while reporting site labels, source IP, routing interface, gateway,
+#          and reachability status. Example targets below use documentation
+#          blocks; replace them with environment-specific hosts as needed.
+# ===============================================================================
+
+# ===============================================================================
+# SECTION: Bootstrap — enforce Bash >=4 before continuing.
+# ===============================================================================
+ensure_bash() {
+  MIN_MAJOR=4
+
+  # Prevent recursion if already re-executed under Bash.
+  if [ -n "${ENSURE_BASH_DONE:-}" ]; then
+    return 0
+  fi
+  export ENSURE_BASH_DONE=1
+
+  # If already running in a sufficient Bash, nothing to do.
+  if [ -n "${BASH_VERSION:-}" ] && [ -n "${BASH_VERSINFO[0]:-}" ] && [ "${BASH_VERSINFO[0]}" -ge "$MIN_MAJOR" ]; then
+    return 0
+  fi
+
+  # Locate a usable Bash binary.
+  if command -v bash >/dev/null 2>&1; then
+    BASH_PATH="$(command -v bash)"
+  elif type -P bash >/dev/null 2>&1; then
+    BASH_PATH="$(type -P bash)"
+  else
+    for CAND in /opt/freeware/bin/bash /usr/bin/bash /bin/bash; do
+      if [ -x "$CAND" ]; then
+        BASH_PATH="$CAND"
+        break
+      fi
+    done
+  fi
+
+  # Fail fast if Bash cannot be located or is too old.
+  if [ -z "${BASH_PATH:-}" ]; then
+    printf 'ERROR: bash >= %s not found in PATH or standard locations.\n' "$MIN_MAJOR" >&2
+    exit 2
+  fi
+
+  BVER="$("$BASH_PATH" -c 'printf "%s\n" "${BASH_VERSINFO[0]:-0}"' 2>/dev/null || echo 0)"
+  if [ "${BVER:-0}" -lt "$MIN_MAJOR" ]; then
+    printf 'ERROR: bash at %s has major version %s < %s\n' "$BASH_PATH" "$BVER" "$MIN_MAJOR" >&2
+    exit 2
+  fi
+
+  # Restart under the located Bash interpreter.
+  exec "$BASH_PATH" --noprofile --norc -s "$@"
+}
+
+ensure_bash "$@"
+
+# ===============================================================================
+# SECTION: Configuration — list of targets to probe (replace as needed).
+# ===============================================================================
+TARGET_PING_HOSTS=(
+  "192.0.2.10 example-target-a"
+  "198.51.100.20 example-target-b"
+)
+
+# ===============================================================================
+# SECTION: Environment detection — capture host metadata and helpers.
+# ===============================================================================
+HOSTNAME_SHORT=$(hostname)
+HOSTNAME_SHORT=${HOSTNAME_SHORT%%.*}
+OS_NAME=$(uname)
+OS_LABEL="$OS_NAME"
+SITE="${SITE_LABEL:-NA}"
+SOURCE_IP=""
+
+# Helper placeholders; configured per-OS below.
+PING_CMD() { :; }
+get_route_iface() { :; }
+get_gateway() { :; }
+
+configure_aix() {
+  OS_LABEL="AIX"
+  SOURCE_IP="$(ifconfig -a | grep "inet 10" | awk '{print $2}' | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | tail -1)"
+
+  SITE="${SITE_LABEL:-$SITE}"
+
+  get_route_iface() {
+    route -n get "$1" 2>/dev/null | awk '/interface|interf addr/ {print $NF; exit}'
+  }
+
+  get_gateway() {
+    GW=$(route -n get "$1" 2>/dev/null | awk '/gateway: / {print $2; exit}')
+    if [[ -z "$GW" ]]; then
+      echo "DIRECT"
+    else
+      echo "$GW"
+    fi
+  }
+
+  PING_CMD() { ping -S "$SOURCE_IP" -c1 -w1 "$1" >/dev/null 2>&1; }
+}
+
+configure_linux() {
+  OS_LABEL="Linux"
+
+  SITE="${SITE_LABEL:-$SITE}"
+
+  local interfaces=("eth1" "bond0")
+  SOURCE_IP=""
+  for interface in "${interfaces[@]}"; do
+    SOURCE_IP="$(ip -o -4 addr show dev "$interface" 2>/dev/null | awk '/inet / {print $4}' | cut -d/ -f1)"
+    if [[ -n "$SOURCE_IP" ]]; then break; fi
+  done
+
+  if [[ -z "$SOURCE_IP" ]]; then
+    SOURCE_IP="$(ip a | grep "inet 10" | awk '{print $2}' | cut -d/ -f1 | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | tail -1)"
+    [[ -n "$SOURCE_IP" ]] && SOURCE_IP="${SOURCE_IP} X"
+  fi
+
+  get_route_iface() {
+    ip route get "$1" 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
+  }
+
+  get_gateway() {
+    GW=$(ip route get "$1" 2>/dev/null | awk '/via/ {for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}' | head -1)
+    if [[ -z "$GW" ]]; then
+      echo "DIRECT"
+    else
+      echo "$GW"
+    fi
+  }
+
+  PING_CMD() { ping -I "$SOURCE_IP" -c1 -w1 "$1" >/dev/null 2>&1; }
+}
+
+select_environment() {
+  if [[ "$OS_NAME" == "AIX" ]]; then
+    configure_aix
+  else
+    configure_linux
+  fi
+}
+
+# ===============================================================================
+# SECTION: Reporting — perform tests and emit one line per target.
+# ===============================================================================
+emit_result() {
+  local ip="$1" label="$2" gateway="$3" iface="$4" status="$5"
+  echo "$HOSTNAME_SHORT|$OS_LABEL|$SITE|$SOURCE_IP|$ip|$label|$gateway|$iface|$status"
+}
+
+run_checks() {
+  for ENTRY in "${TARGET_PING_HOSTS[@]}"; do
+    IP_TO_PING=$(echo "$ENTRY" | awk '{print $1}')
+    HOST_LABEL=$(echo "$ENTRY" | awk '{print $2}')
+
+    if PING_CMD "$IP_TO_PING"; then
+      PING_RESULT="OK"
+    else
+      PING_RESULT="NOK"
+    fi
+
+    GATEWAY=$(get_gateway "$IP_TO_PING")
+    ROUTE_IFACE=$(get_route_iface "$IP_TO_PING")
+    emit_result "$IP_TO_PING" "$HOST_LABEL" "$GATEWAY" "$ROUTE_IFACE" "$PING_RESULT"
+  done
+}
+
+main() {
+  select_environment
+  run_checks
+}
+
+main "$@"

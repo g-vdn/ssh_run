@@ -307,10 +307,15 @@ If any required command is missing, the script stops immediately with a clear er
 
 ---
 
-## 7. Payload Template
+## 7. Payloads
 
-`payload_template` is optional and serves as a reference for building structured payloads.  
-It is streamed directly to each target and executed as root via:
+All payloads live under `payloads/`. The directory includes ready-to-use scripts
+such as `payload_generate_NFS_report` and `payload_ping_test`, plus a reusable
+template. See `payloads/README.md` for a quick reference on what each payload
+does, expected outputs, and usage examples.
+
+`payloads/payload_template` is optional and serves as a reference for building
+structured payloads. It is streamed directly to each target and executed as root via:
 
 ```bash
 cat payload_file | ssh target "sudo su -"

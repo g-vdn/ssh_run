@@ -1,0 +1,948 @@
+#!/usr/bin/env bash
+
+# ===============================================================================
+# payload_generate_NFS_report
+# -------------------------------------------------------------------------------
+# Author : George Vaideanu
+# Contact: george@vaideanu.ro
+# Version: 5.0
+# Summary: Inventories NFS mounts and autofs-managed entries on AIX and Linux
+#          hosts, correlates configuration with live mounts, and emits a
+#          semicolon-delimited CSV enriched with filesystem statistics.
+# Notes  : Usage guidance and column definitions are documented in
+#          payloads/README.md alongside this script.
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Ensure we are running under Bash even if invoked via /bin/sh or via sudo/ssh.
+# ------------------------------------------------------------------------------
+if [ -z "${BASH_VERSION:-}" ]; then
+exec /usr/bin/env bash -l -s "$@"
+fi
+
+# ------------------------------------------------------------------------------
+# Global debug toggle (enabled via -d); all debug text goes to stderr.
+# We remove only the first -d from "$@" to preserve other args if any.
+# ------------------------------------------------------------------------------
+DEBUG=0
+for arg in "$@"; do
+if [ "$arg" = "-d" ]; then
+DEBUG=1
+# strip one -d
+set -- "${@/-d/}"
+break
+fi
+done
+
+# dbg() prints a namespaced debug line with (best-effort) caller function name.
+dbg() {
+if [ "$DEBUG" -eq 1 ]; then
+local caller="${FUNCNAME[1]:-MAIN}"
+echo "DBG: [$caller] $*" >&2
+fi
+}
+
+# ===============================================================================
+# SECTION: Environment & Global State
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Function : setup_env
+# Purpose  : Detect OS/host/SID, set PATH & locale, initialize global state and
+#            declare associative arrays used throughout the script.
+# Inputs   : none (reads system)
+# Outputs  : GLOBALS:
+#            - HOSTNAME_SHORT : hostname without FQDN (e.g., "server01")
+#            - OS_SIMPLE      : "AIX" or "Linux" (or uname if neither)
+#            - SID_GLOBAL     : parsed from /etc/motd if present (else "-")
+#            - OUT_*          : associative arrays for final output rows
+#            - AF_*           : autofs catalog associative arrays
+#            - counters       : MASTER_ENTRIES, MAPFILES_OPENED, etc.
+# ------------------------------------------------------------------------------
+setup_env() {
+# Keep environment/system variables ALL CAPS (conventional).
+export LANG=C LC_ALL=C PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin
+
+# Hostname (short) — used in CSV "Hostname" column.
+HOSTNAME_SHORT=$(hostname 2>/dev/null || echo unknown)
+HOSTNAME_SHORT=${HOSTNAME_SHORT%%.*}
+
+# OS detection (used for dispatching to AIX/Linux-specific collectors).
+UNAME=$(uname -s 2>/dev/null || echo Unknown)
+case "$UNAME" in
+Linux*) OS_SIMPLE="Linux" ;;
+AIX*) OS_SIMPLE="AIX" ;;
+*) OS_SIMPLE="$UNAME" ;; # fallback; still printed into CSV
+esac
+
+# SID (if the platform standardizes it in /etc/motd). Otherwise "-"
+SID_GLOBAL="-"
+if [ -r /etc/motd ]; then
+# Try "SID : VALUE"
+SID_GLOBAL=$(awk -F: '/^[[:space:]]*SID[[:space:]]*/{ gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit }' /etc/motd 2>/dev/null)
+# Fallback "SID VALUE"
+[ -z "$SID_GLOBAL" ] && SID_GLOBAL=$(awk '/^SID[[:space:]]/{print $2; exit}' /etc/motd 2>/dev/null)
+[ -z "$SID_GLOBAL" ] && SID_GLOBAL="-"
+fi
+
+# ------------------------------
+# Output associative arrays:
+# ------------------------------
+# OUT_VER          : mountpoint -> NFS version (e.g., "3", "4.1", "unknown")
+# OUT_OPTIONS      : mountpoint -> raw mount options string
+# OUT_SOURCE       : mountpoint -> "server:/export/path"
+# OUT_IS_AUTOFS    : mountpoint -> "yes (active)" | "yes (inactive)" | "no"
+# OUT_FILE         : mountpoint -> where we learned about it (mapfile or live)
+# OUT_NFS_SERVER   : mountpoint -> "Yes" | "No" | "NA" | "Error" (AIX only, indicates if server exports that mount)
+# OUT_DF_BLOCKS    : mountpoint -> filesystem size in GB (two decimals)
+# OUT_DF_FREE      : mountpoint -> free GB (two decimals)
+# OUT_DF_PERC_USED : mountpoint -> "%Used"
+# OUT_DF_IUSED     : mountpoint -> inodes used (if available)
+# OUT_DF_PERC_IUSED: mountpoint -> "%Iused" (if available)
+declare -gA OUT_VER OUT_OPTIONS OUT_SOURCE OUT_IS_AUTOFS OUT_FILE
+declare -gA OUT_NFS_SERVER
+declare -gA OUT_DF_BLOCKS OUT_DF_FREE OUT_DF_PERC_USED OUT_DF_IUSED OUT_DF_PERC_IUSED
+
+# ------------------------------
+# Autofs catalog associative arrays:
+# ------------------------------
+# AF_VER      : mountpoint -> version extracted from autofs options
+# AF_OPTIONS  : mountpoint -> autofs entry options
+# AF_SOURCE   : mountpoint -> "server:/export/path" from autofs
+# AF_FILE     : mountpoint -> mapfile path that declared this autofs entry
+# AF_BY_SOURCE: "server:/export/path" -> mountpoint (reverse lookup)
+declare -gA AF_VER AF_OPTIONS AF_SOURCE AF_BY_SOURCE AF_FILE
+
+# Counters (for summaries):
+MASTER_ENTRIES=0
+MAPFILES_OPENED=0
+AUTOFS_ENTRIES=0
+ACTIVE_NFS=0
+INACTIVE_ADDED=0
+TOTAL_EMITTED=0
+
+dbg "===== ENTER ====="
+dbg "host=${HOSTNAME_SHORT} os=${OS_SIMPLE} sid=${SID_GLOBAL}"
+dbg "===== EXIT ====="
+}
+
+# ===============================================================================
+# SECTION: NFS server check helpers (AIX only)
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Function : check_if_cluster
+# Purpose  : Detect if AIX host is part of a PowerHA/HACMP cluster.
+# Returns  : 0 = standalone (not in cluster), 1 = cluster node.
+# ------------------------------------------------------------------------------
+check_if_cluster() {
+if command -v lssrc >/dev/null 2>&1 && lssrc -s clstrmgrES >/dev/null 2>&1; then
+# Cluster manager service exists and is active → cluster node
+return 1
+fi
+return 0
+}
+
+# ------------------------------------------------------------------------------
+# Function : check_nfs_server_export
+# Purpose  : Verify if a given mountpoint is exported by this AIX server.
+# Inputs   : $1 = mountpoint path
+# Outputs  : One of: Yes | No | NA | Error
+# ------------------------------------------------------------------------------
+check_nfs_server_export() {
+local mountpoint="$1"
+
+# Only for AIX systems
+if [[ "$OS_SIMPLE" != "AIX" ]]; then
+echo "NA"
+return
+fi
+
+# Skip autofs-managed mountpoints
+if [[ "${OUT_IS_AUTOFS[$mountpoint]}" == yes* ]]; then
+echo "NA"
+return
+fi
+
+local line server ip
+
+# Get NFS mount line from the "mount" command
+line=$(mount | grep " $mountpoint " | grep nfs | head -1)
+[ -z "$line" ] && {
+echo "Error-mount"
+return
+}
+
+# Extract NFS server name or IP (part before ':')
+server=$(echo "$line" | awk '{print $1}' | cut -d: -f1)
+[ -z "$server" ] && {
+echo "Error-server"
+return
+}
+
+# If already an IP, skip DNS lookup
+if [[ "$server" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+ip="$server"
+else
+# Resolve hostname to IP (strip commas if present)
+ip=$(host "$server" 2>/dev/null |
+awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+,?$/){gsub(/,/, "", $i); print $i; exit}}')
+[ -z "$ip" ] && {
+echo "Error-dns"
+return
+}
+fi
+
+# Check if the resolved IP belongs to this host
+if /usr/sbin/ifconfig -a | grep -qw "$ip"; then
+echo "Yes"
+else
+echo "No"
+fi
+}
+
+# ===============================================================================
+# SECTION: Helpers (shared utilities)
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Function : sanitize
+# Purpose  : Normalize data for CSV:
+#            - collapse multiple spaces
+#            - replace semicolons ';' (CSV separator) with a space
+#            - remove newlines
+# Inputs   : $1 - string to sanitize
+# Outputs  : sanitized single-line string on stdout
+# ------------------------------------------------------------------------------
+sanitize() {
+printf '%s' "$1" |
+tr '\n' ' ' |
+tr -s ' ' |
+sed 's/;/ /g' |
+awk '{$1=$1;print}'
+}
+
+# ------------------------------------------------------------------------------
+# Function : normalize_mp
+# Purpose  : Ensure a mountpoint is absolute, no trailing slash (except root).
+# Inputs   : $1 - mountpoint string
+# Outputs  : normalized mountpoint on stdout
+# ------------------------------------------------------------------------------
+normalize_mp() {
+local mp="$1"
+mp=$(printf '%s' "$mp" | awk '{$1=$1;print}')
+case "$mp" in
+/*) : ;;        # already absolute
+*) mp="/$mp" ;; # enforce absolute
+esac
+[ "$mp" != "/" ] && mp="${mp%/}" # drop trailing slash if not root
+printf '%s' "$mp"
+}
+
+# ------------------------------------------------------------------------------
+# Function : extract_vers
+# Purpose  : Extract NFS version from an options string (e.g. "...,vers=3,...").
+# Inputs   : $1 - options string
+# Outputs  : version (e.g., "3", "4.1" or "unknown") on stdout
+# ------------------------------------------------------------------------------
+extract_vers() {
+local s="$1" v
+v=$(printf '%s' "$s" | sed -n 's/.*vers=\([0-9][0-9.:]*\).*/\1/p')
+v=${v//:/,}
+v=$(printf '%s' "$v" | sed 's/^,*//;s/,*$//') # trim stray commas
+[ -n "$v" ] && printf '%s' "$v" || printf 'unknown'
+}
+
+# ===============================================================================
+# SECTION: AUTOFs master + mapfiles processing
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Function : parse_master_files
+# Purpose  : Parse the autofs "master" config(s), discovering mapfiles and the
+#            mapping type (direct/indirect).
+# Inputs   : none (reads /etc/auto.master and/or /etc/auto_master)
+# Outputs  : GLOBAL:
+#            - MASTER_TRIPLES (bash array) with elements "type|parent|mapfile"
+#            - MASTER_ENTRIES (counter)
+# Debug    : Logs inclusions (+dir:, include), validation failures, and entries.
+# ------------------------------------------------------------------------------
+parse_master_files() {
+dbg "===== ENTER ====="
+MASTER_TRIPLES=() # array of "type|parent|mapfile" (direct/indirect)
+
+# --- inner helper: parse a single master file and append discovered entries ---
+_parse_master_file() {
+local mf="$1"
+dbg "parse master: $mf"
+[ -f "$mf" ] || {
+dbg "missing $mf"
+return
+}
+
+local raw line
+while IFS= read -r raw || [ -n "$raw" ]; do
+# strip comments and trim
+line=$(printf '%s' "$raw" | sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//')
+[ -z "$line" ] && continue
+
+case "$line" in
++dir:*)
+# +dir:/etc/auto.master.d — include every file in a directory
+local dirspec="${line#+dir:}"
+dbg "include +dir: $dirspec"
+if [ -d "$dirspec" ]; then
+for f in "$dirspec"/*; do
+[ -f "$f" ] && _parse_master_file "$f"
+done
+else
+dbg "missing +dir dir: $dirspec"
+fi
+continue
+;;
++*)
+# +auto.master — NIS/netmaps; not locally parseable
+dbg "skip +map (not locally parseable): $line"
+continue
+;;
+include\ *)
+# inline include path(s) or directory
+local inc
+inc=$(awk '{print $2}' <<<"$line")
+dbg "inline include: $inc"
+if [ -d "$inc" ]; then
+for f in "$inc"/*; do [ -f "$f" ] && _parse_master_file "$f"; done
+else
+for f in $inc; do [ -f "$f" ] && _parse_master_file "$f"; done
+fi
+continue
+;;
+esac
+
+# master line format: <parent> <map> [options...]
+local parent
+parent=$(awk '{print $1}' <<<"$line")
+case "$parent" in /*) : ;; *)
+dbg "invalid parent '$parent' in: $line"
+continue
+;;
+esac
+
+# find first non-option token after parent → mapfile path (or parenthesized)
+local token mapfile=""
+while read -r token; do
+case "$token" in
+-*) continue ;;                                              # skip options
+*\)*) token=$(sed -n 's/.*(\([^)]*\))$/\1/p' <<<"$token") ;; # (map)
+esac
+mapfile="$token"
+break
+done < <(awk '{for(i=2;i<=NF;i++) print $i}' <<<"$line")
+
+[ -z "$mapfile" ] && {
+dbg "skip (no mapfile) $line"
+continue
+}
+
+local type="indirect"
+[ "$parent" = "/-" ] && type="direct"
+MASTER_TRIPLES+=("${type}|${parent}|${mapfile}")
+MASTER_ENTRIES=$((MASTER_ENTRIES + 1))
+dbg "master entry: type=$type parent=$parent mapfile=$mapfile"
+done <"$mf"
+}
+
+# Linux autofs master
+[ -f /etc/auto.master ] && _parse_master_file "/etc/auto.master"
+# AIX autofs master
+[ -f /etc/auto_master ] && _parse_master_file "/etc/auto_master"
+
+dbg "summary: master_entries=${MASTER_ENTRIES}"
+dbg "===== EXIT ====="
+}
+
+# ------------------------------------------------------------------------------
+# Function : collect_autofs
+# Purpose  : Open every discovered mapfile, parse key → (opts) target entries,
+#            and fill the autofs catalog (AF_* arrays).
+# Inputs   : MASTER_TRIPLES (built by parse_master_files)
+# Outputs  : AF_VER/AF_OPTIONS/AF_SOURCE/AF_FILE/AF_BY_SOURCE, AUTOFS_ENTRIES
+# Debug    : Logs each autofs record and duplicates/unsupported lines.
+# ------------------------------------------------------------------------------
+collect_autofs() {
+dbg "===== ENTER ====="
+
+# --- inner helper: parse a single mapfile (direct or indirect)  ---
+_parse_mapfile() {
+local type="$1" parent="$2" mapfile="$3"
+[ -f "$mapfile" ] || {
+dbg "missing mapfile: $mapfile"
+return
+}
+MAPFILES_OPENED=$((MAPFILES_OPENED + 1))
+dbg "open mapfile=$mapfile (type=$type parent=$parent)"
+
+local raw line lineno=0
+local key rest opts target mp
+while IFS= read -r raw || [ -n "$raw" ]; do
+lineno=$((lineno + 1))
+
+# strip comments and trim
+line=$(printf '%s' "$raw" | sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//')
+[ -z "$line" ] && continue
+
+# skip entries that are not simple 'key [-opts] server:/export'
+case "$line" in +* | program* | if* | {* | }* | print* | cache=* | *'$'* )
+dbg "skip mapfile syntax (file=${mapfile}:line=${lineno}): $line"
+continue
+;;
+esac
+
+# First field is the key (either absolute for direct map, or relative)
+key=$(awk '{print $1}' <<<"$line")
+rest=$(cut -d' ' -f2- <<<"$line")
+
+# Compute the final mountpoint (mp) based on map type
+if [ "$type" = "direct" ]; then
+mp=$(normalize_mp "$key")
+else
+mp=$(normalize_mp "$parent/$key")
+fi
+
+# Two common autofs syntaxes:
+#   key  -opts   server:/export/path
+#   key  (no -)  server:/export/path   [opts before the server are rare but handled]
+if [[ "$rest" =~ ^- ]]; then
+opts=$(awk '{print $1}' <<<"$rest" | sed 's/^-//')
+target=$(awk '{print $NF}' <<<"$rest")
+else
+target=$(awk '{print $NF}' <<<"$rest")
+opts=$(awk '{$NF=""; print $0}' <<<"$rest" | awk '{$1=$1;print}')
+[ -z "$opts" ] && opts="-"
+fi
+
+# Basic validation: target must look like "host:/path"
+if [[ ! "$target" == *:* ]]; then
+dbg "discard non host:path (file=${mapfile}:line=${lineno}): $line"
+continue
+fi
+
+# If fstype is present, keep only NFS/NFS4
+if echo "$opts" | grep -q 'fstype='; then
+local fval
+fval=$(echo "$opts" | sed -n 's/.*fstype=\([^,[:space:]]*\).*/\1/p')
+if [ -n "$fval" ] && ! echo "$fval" | grep -Eq '^nfs(4)?$'; then
+dbg "skip non-nfs fstype=$fval (file=${mapfile}:line=${lineno})"
+continue
+fi
+fi
+
+# First come, first served — keep the first mapfile defining a given mp
+if [ -z "${AF_SOURCE[$mp]+x}" ]; then
+AF_VER["$mp"]="$(extract_vers "$opts")"
+AF_OPTIONS["$mp"]="$opts"
+AF_SOURCE["$mp"]="$target"
+AF_FILE["$mp"]="$mapfile"
+AF_BY_SOURCE["$target"]="$mp"
+AUTOFS_ENTRIES=$((AUTOFS_ENTRIES + 1))
+dbg "RECORD autofs $mp ← $target (opts=$opts file=$mapfile)"
+else
+dbg "duplicate autofs mp=$mp in ${mapfile}: keeping first (${AF_FILE[$mp]})"
+fi
+done <"$mapfile"
+}
+
+# Parse all discovered mapfiles
+local entry type parent mapfile
+for entry in "${MASTER_TRIPLES[@]}"; do
+type="${entry%%|*}"
+entry="${entry#*|}"
+parent="${entry%%|*}"
+mapfile="${entry#*|}"
+_parse_mapfile "$type" "$parent" "$mapfile"
+done
+
+dbg "summary: mapfiles_opened=${MAPFILES_OPENED} autofs_entries=${AUTOFS_ENTRIES}"
+dbg "===== EXIT ====="
+}
+
+# ------------------------------------------------------------------------------
+# Function : print_autofs_audit
+# Purpose  : Optional helper to dump the autofs catalog for debugging correlation:
+#            - mountpoint -> mapfile (AF_FILE)
+#            - by-source reverse mapping (AF_BY_SOURCE)
+# Inputs   : AF_* arrays
+# Outputs  : debug lines (only when -d given)
+# ------------------------------------------------------------------------------
+print_autofs_audit() {
+[ "$DEBUG" -ne 1 ] && return
+dbg "===== ENTER ====="
+local mp
+for mp in $(printf '%s\n' "${!AF_FILE[@]}" | sort); do
+dbg "MAP: $mp -> ${AF_FILE[$mp]}"
+done
+local src
+for src in $(printf '%s\n' "${!AF_BY_SOURCE[@]}" | sort); do
+local m="${AF_BY_SOURCE[$src]}"
+dbg "BY-SRC: $src -> $m -> ${AF_FILE[$m]}"
+done
+dbg "===== EXIT ====="
+}
+
+# ===============================================================================
+# SECTION: Filesystem stats (df) — dispatcher + OS-specific implementations
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Function : collect_df
+# Purpose  : Wrapper to call the correct OS-specific df collector.
+# Inputs   : $1 - mountpoint
+# Outputs  : OUT_DF_* arrays updated for the given mountpoint.
+# ------------------------------------------------------------------------------
+collect_df() {
+dbg "===== ENTER (dispatch → ${OS_SIMPLE}) ====="
+case "$OS_SIMPLE" in
+AIX) collect_df_aix "$@" ;;
+Linux) collect_df_linux "$@" ;;
+*) dbg "Unsupported OS: ${OS_SIMPLE}" ;;
+esac
+dbg "===== EXIT ====="
+}
+
+# ------------------------------------------------------------------------------
+# Function : collect_df_aix
+# Purpose  : Populate OUT_DF_* for a mountpoint using AIX "df -g" output.
+# Inputs   : $1 - mountpoint
+# Outputs  : OUT_DF_BLOCKS/OUT_DF_FREE/OUT_DF_PERC_USED/OUT_DF_IUSED/OUT_DF_PERC_IUSED
+# ------------------------------------------------------------------------------
+collect_df_aix() {
+dbg "===== ENTER ====="
+local mp="$1"
+[ -n "$mp" ] || {
+dbg "no mp passed"
+dbg "===== EXIT ====="
+return
+}
+
+# Initialize defaults in case df fails
+OUT_DF_BLOCKS["$mp"]="-"
+OUT_DF_FREE["$mp"]="-"
+OUT_DF_PERC_USED["$mp"]="-"
+OUT_DF_IUSED["$mp"]="-"
+OUT_DF_PERC_IUSED["$mp"]="-"
+
+dbg "--- START df: $mp ---"
+# AIX df -g prints size/free/%used/%iused in second line
+local line
+line=$(LC_ALL=C df -g "$mp" 2>/dev/null | awk 'NR==2')
+if [ -z "$line" ]; then
+dbg "df -g returned no data for $mp"
+dbg "--- END df: $mp ---"
+dbg "===== EXIT ====="
+return
+fi
+
+# Parse columns, keeping decimals for GB (printf "%.2f").
+local gb_blocks free_gb used_pct iused iused_pct
+gb_blocks=$(awk '{printf "%.2f",$2+0}' <<<"$line" 2>/dev/null)
+free_gb=$(awk '{printf "%.2f",$3+0}' <<<"$line" 2>/dev/null)
+used_pct=$(awk '{print $4}' <<<"$line" | tr -d '%')
+iused=$(awk '{print $5}' <<<"$line")
+iused_pct=$(awk '{print $6}' <<<"$line" | tr -d '%')
+
+[ -n "$gb_blocks" ] && OUT_DF_BLOCKS["$mp"]="$gb_blocks"
+[ -n "$free_gb" ] && OUT_DF_FREE["$mp"]="$free_gb"
+[ -n "$used_pct" ] && OUT_DF_PERC_USED["$mp"]="${used_pct}%"
+[ -n "$iused" ] && OUT_DF_IUSED["$mp"]="$iused"
+[ -n "$iused_pct" ] && OUT_DF_PERC_IUSED["$mp"]="${iused_pct}%"
+dbg "df AIX: blocks=${OUT_DF_BLOCKS[$mp]} free=${OUT_DF_FREE[$mp]} used=${OUT_DF_PERC_USED[$mp]} iused=${OUT_DF_IUSED[$mp]} iused%=${OUT_DF_PERC_IUSED[$mp]}"
+dbg "--- END df: $mp ---"
+dbg "===== EXIT ====="
+}
+
+# ------------------------------------------------------------------------------
+# Function : collect_df_linux
+# Purpose  : Populate OUT_DF_* for a mountpoint using Linux "df -Pk" and "df -Pi".
+# Inputs   : $1 - mountpoint
+# Outputs  : OUT_DF_BLOCKS/OUT_DF_FREE/OUT_DF_PERC_USED/OUT_DF_IUSED/OUT_DF_PERC_IUSED
+# ------------------------------------------------------------------------------
+collect_df_linux() {
+dbg "===== ENTER ====="
+local mp="$1"
+[ -n "$mp" ] || {
+dbg "no mp passed"
+dbg "===== EXIT ====="
+return
+}
+
+OUT_DF_BLOCKS["$mp"]="-"
+OUT_DF_FREE["$mp"]="-"
+OUT_DF_PERC_USED["$mp"]="-"
+OUT_DF_IUSED["$mp"]="-"
+OUT_DF_PERC_IUSED["$mp"]="-"
+
+dbg "--- START df: $mp ---"
+# Block stats in KB (convert to GB, 2 decimals)
+local df_line blocks avail perc
+if df_line=$(df -Pk "$mp" 2>/dev/null | awk 'NR==2{print $2,$3,$4,$5}'); then
+blocks=$(awk '{print $1}' <<<"$df_line")
+avail=$(awk '{print $3}' <<<"$df_line")
+perc=$(awk '{print $4}' <<<"$df_line" | tr -d '%')
+OUT_DF_BLOCKS["$mp"]="$(awk -v b="$blocks" 'BEGIN{printf "%.2f", b/1024/1024}')"
+OUT_DF_FREE["$mp"]="$(awk -v a="$avail" 'BEGIN{printf "%.2f", a/1024/1024}')"
+OUT_DF_PERC_USED["$mp"]="${perc}%"
+fi
+# Inode stats
+local df_i_line iused iperc
+if df_i_line=$(df -Pi "$mp" 2>/dev/null | awk 'NR==2{print $2,$3,$4,$5}'); then
+iused=$(awk '{print $2}' <<<"$df_i_line")
+iperc=$(awk '{print $4}' <<<"$df_i_line" | tr -d '%')
+[ -n "$iused" ] && OUT_DF_IUSED["$mp"]="$iused"
+[ -n "$iperc" ] && OUT_DF_PERC_IUSED["$mp"]="${iperc}%"
+fi
+dbg "df Linux: blocks=${OUT_DF_BLOCKS[$mp]} free=${OUT_DF_FREE[$mp]} used=${OUT_DF_PERC_USED[$mp]} iused=${OUT_DF_IUSED[$mp]} iused%=${OUT_DF_PERC_IUSED[$mp]}"
+dbg "--- END df: $mp ---"
+dbg "===== EXIT ====="
+}
+
+# ===============================================================================
+# SECTION: Active NFS collection — dispatcher + OS-specific implementations
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Function : collect_active
+# Purpose  : Wrapper that selects the OS-specific active NFS collector.
+# Inputs   : none
+# Outputs  : OUT_* arrays populated for active mounts; ACTIVE_NFS counter.
+# ------------------------------------------------------------------------------
+collect_active() {
+dbg "===== ENTER (dispatch → ${OS_SIMPLE}) ====="
+case "$OS_SIMPLE" in
+AIX) collect_active_aix ;;
+Linux) collect_active_linux ;;
+*) dbg "Unsupported OS: ${OS_SIMPLE}" ;;
+esac
+dbg "===== EXIT ====="
+}
+
+# ------------------------------------------------------------------------------
+# Function : collect_active_aix
+# Purpose  : Parse "nfsstat -m" and collect active NFS mounts on AIX. For each
+#            mount, detect autofs correlation using AF_* and collect df metrics.
+# Inputs   : nfsstat -m output
+# Outputs  : OUT_* arrays updated; ACTIVE_NFS incremented per active NFS.
+# Debug    : Per-mount START/END blocks, with source/opts/version/file decisions.
+# ------------------------------------------------------------------------------
+collect_active_aix() {
+dbg "===== ENTER ====="
+local out
+out=$(nfsstat -m 2>/dev/null || true)
+if [ -z "$out" ]; then
+dbg "nfsstat -m empty or failed"
+dbg "===== EXIT ====="
+return
+fi
+
+# We parse nfsstat -m as a state machine:
+#   - header lines contain "<mount> from <server:/export>"
+#   - following lines contain labeled options (e.g., "vers=3,proto=tcp,...")
+local line t
+local cur_mp="" cur_from="" cur_opts=""
+
+# flush the currently parsed block into OUT_* and collect df
+_flush_current() {
+[ -n "$cur_mp" ] || return
+local mp ver opts from mp_from_map is_auto file_hint
+mp=$(normalize_mp "$cur_mp")
+from="$cur_from"
+# Flatten collected option lines into a single comma-delimited string
+opts=$(printf '%s' "$cur_opts" | tr -d '\r' | sed 's/[[:space:]]\+/,/g; s/,,\+/,/g; s/^,\|,$//g')
+ver=$(extract_vers "$opts")
+
+dbg "--- START mount: $mp ---"
+dbg "source=${from}"
+dbg "opts=${opts} ver=${ver}"
+
+OUT_VER["$mp"]="$ver"
+OUT_OPTIONS["$mp"]="$opts"
+OUT_SOURCE["$mp"]="$from"
+
+# Autofs correlation (prefer mountpoint match; fallback to source match)
+if [ -n "${AF_SOURCE[$mp]+x}" ] || [ -n "${AF_BY_SOURCE[$from]+x}" ]; then
+is_auto="yes (active)"
+if [ -n "${AF_FILE[$mp]+x}" ]; then
+file_hint="${AF_FILE[$mp]}"
+elif [ -n "${AF_BY_SOURCE[$from]+x}" ]; then
+mp_from_map="${AF_BY_SOURCE[$from]}"
+file_hint="${AF_FILE[$mp_from_map]:-nfsstat}"
+dbg "autofs by-source match: ${from} -> ${mp_from_map}"
+else
+file_hint="nfsstat"
+fi
+else
+is_auto="no"
+file_hint="nfsstat"
+fi
+
+OUT_IS_AUTOFS["$mp"]="$is_auto"
+OUT_FILE["$mp"]="$file_hint"
+
+# --- NFS Server export check (AIX only) ---
+OUT_NFS_SERVER["$mp"]="$(check_nfs_server_export "$mp")"
+dbg "nfs_server=${OUT_NFS_SERVER[$mp]}"
+
+collect_df "$mp"
+ACTIVE_NFS=$((ACTIVE_NFS + 1))
+
+dbg "decision: type=nfs auto=${is_auto} file=${file_hint}"
+dbg "recorded: $mp ← $from"
+dbg "--- END mount: $mp ---"
+
+cur_mp=""
+cur_from=""
+cur_opts=""
+}
+
+# Read nfsstat output; build blocks
+while IFS= read -r line || [ -n "$line" ]; do
+t=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+[ -z "$t" ] && continue
+case "$t" in
+*" from "*)
+_flush_current
+cur_mp=$(printf '%s\n' "$t" | awk '{print $1}')
+cur_from=$(printf '%s\n' "$t" | sed -n 's/.*[[:space:]]from[[:space:]]\([^[:space:]]*\).*/\1/p')
+dbg "header: mp=${cur_mp} from=${cur_from}"
+;;
+*)
+if [ -n "$cur_mp" ]; then
+# Remove the "label:" prefix on option lines; keep the values
+local clean
+clean=$(printf '%s' "$t" | sed 's/^[[:alpha:]_-][[:alnum:]_.-]*:[[:space:]]*//')
+[ -n "$clean" ] && cur_opts="${cur_opts:+$cur_opts,}${clean}"
+fi
+;;
+esac
+done <<<"$out"
+_flush_current
+
+dbg "summary: active_nfs=${ACTIVE_NFS}"
+dbg "===== EXIT ====="
+}
+
+# ------------------------------------------------------------------------------
+# Function : collect_active_linux
+# Purpose  : Parse /proc/mounts for nfs/nfs4 lines, determine autofs correlation,
+#            and populate OUT_* arrays per active mount; collect df per mount.
+# Inputs   : /proc/mounts
+# Outputs  : OUT_* arrays updated; ACTIVE_NFS incremented per active NFS.
+# Debug    : Per-mount START/END decision traces.
+# ------------------------------------------------------------------------------
+collect_active_linux() {
+dbg "===== ENTER ====="
+local mounts
+if ! mounts=$(cat /proc/mounts 2>/dev/null); then
+dbg "cannot read /proc/mounts"
+dbg "===== EXIT ====="
+return
+fi
+
+# pass1: collect autofs triggers from /proc/mounts (type=autofs)
+declare -A auto_trig
+dbg "pass1: autofs triggers"
+local line src mp fstype opts
+while IFS= read -r line; do
+src=$(awk '{print $1}' <<<"$line")
+mp=$(awk '{print $2}' <<<"$line")
+fstype=$(awk '{print $3}' <<<"$line")
+if [ "$fstype" = "autofs" ]; then
+mp=$(normalize_mp "$mp")
+auto_trig["$mp"]=1
+dbg "trigger: $mp"
+fi
+done <<<"$mounts"
+
+# pass2: parse nfs/nfs4 lines and build records
+dbg "pass2: nfs/nfs4 entries"
+local ver is_auto file_hint mp_from_map
+while IFS= read -r line; do
+src=$(awk '{print $1}' <<<"$line")
+mp=$(awk '{print $2}' <<<"$line")
+fstype=$(awk '{print $3}' <<<"$line")
+opts=$(awk '{print $4}' <<<"$line")
+
+# we only process nfs/nfs4 filesystems
+if [ "$fstype" != "nfs" ] && [ "$fstype" != "nfs4" ]; then
+continue
+fi
+
+mp=$(normalize_mp "$mp")
+ver=$(extract_vers "$opts")
+
+dbg "--- START mount: $mp ---"
+dbg "line=$line"
+dbg "source=${src}"
+dbg "fstype=${fstype} vers=${ver} opts=${opts}"
+
+OUT_VER["$mp"]="$ver"
+OUT_OPTIONS["$mp"]="$opts"
+OUT_SOURCE["$mp"]="$src"
+
+# Determine autofs status:
+#  1) If the mp or source matches autofs catalog → yes (active)
+#  2) Else if mp under an autofs trigger mountpoint → yes (active)
+#  3) Else → no
+if [ -n "${AF_SOURCE[$mp]+x}" ] || [ -n "${AF_BY_SOURCE[$src]+x}" ]; then
+is_auto="yes (active)"
+else
+is_auto="no"
+local tr
+for tr in "${!auto_trig[@]}"; do
+case "$mp" in
+"$tr" | "$tr"/*)
+is_auto="yes (active)"
+break
+;;
+esac
+done
+fi
+OUT_IS_AUTOFS["$mp"]="$is_auto"
+
+# Source file hint (mapfile if known autofs, else /proc/mounts)
+file_hint="/proc/mounts"
+if [ "$is_auto" = "yes (active)" ]; then
+if [ -n "${AF_FILE[$mp]+x}" ]; then
+file_hint="${AF_FILE[$mp]}"
+elif [ -n "${AF_BY_SOURCE[$src]+x}" ]; then
+mp_from_map="${AF_BY_SOURCE[$src]}"
+file_hint="${AF_FILE[$mp_from_map]:-/proc/mounts}"
+dbg "autofs by-source match: ${src} -> ${mp_from_map}"
+fi
+fi
+OUT_FILE["$mp"]="$file_hint"
+
+collect_df "$mp"
+ACTIVE_NFS=$((ACTIVE_NFS + 1))
+
+dbg "decision: type=${fstype} auto=${is_auto} file=${file_hint}"
+dbg "recorded: $mp ← $src"
+dbg "--- END mount: $mp ---"
+done <<<"$mounts"
+
+dbg "summary: active_nfs=${ACTIVE_NFS}"
+dbg "===== EXIT ====="
+}
+
+# ===============================================================================
+# SECTION: Merge inactive AUTOFs
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Function : merge_autofs_only
+# Purpose  : For autofs entries that did not appear as active mounts, add them
+#            as "yes (inactive)" to provide visibility of configured-but-idle
+#            autofs targets. Also collect df (useful for pre-created dirs).
+# Inputs   : AF_* and OUT_* arrays
+# Outputs  : OUT_* arrays augmented; INACTIVE_ADDED counter increased
+# ------------------------------------------------------------------------------
+merge_autofs_only() {
+dbg "===== ENTER ====="
+local mp
+for mp in "${!AF_SOURCE[@]}"; do
+if [ -z "${OUT_VER[$mp]+x}" ]; then
+dbg "--- START inactive: $mp ---"
+OUT_VER["$mp"]="${AF_VER[$mp]:-unknown}"
+OUT_OPTIONS["$mp"]="${AF_OPTIONS[$mp]:--}"
+OUT_SOURCE["$mp"]="${AF_SOURCE[$mp]}"
+OUT_IS_AUTOFS["$mp"]="yes (inactive)"
+OUT_FILE["$mp"]="${AF_FILE[$mp]}"
+collect_df "$mp" # may remain '-' for unmounted dirs, which is fine
+INACTIVE_ADDED=$((INACTIVE_ADDED + 1))
+dbg "added inactive autofs entry (file=${AF_FILE[$mp]})"
+dbg "--- END inactive: $mp ---"
+fi
+done
+dbg "summary: inactive_added=${INACTIVE_ADDED}"
+dbg "===== EXIT ====="
+}
+
+# ===============================================================================
+# SECTION: CSV emission
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Function : print_rows
+# Purpose  : Emit CSV rows for all mountpoints found, or a placeholder line if
+#            nothing was discovered (to preserve output shape in batch runs).
+# Inputs   : OUT_* arrays, HOSTNAME_SHORT, SID_GLOBAL, OS_SIMPLE
+# Outputs  : CSV lines on stdout
+# ------------------------------------------------------------------------------
+print_rows() {
+dbg "===== ENTER ====="
+local mp printed=0
+local sid_value="$SID_GLOBAL"
+[ -z "$sid_value" ] || [ "$sid_value" = "-" ] && sid_value="NA"
+
+# Sorted output by mountpoint for stable diffs
+for mp in $(printf '%s\n' "${!OUT_VER[@]}" | sort); do
+printed=$((printed + 1))
+# drop leading '-' if options were "-" at source
+local opts="${OUT_OPTIONS[$mp]:--}"
+opts="${opts#-}"
+
+printf '%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s\n' \
+"$(sanitize "$HOSTNAME_SHORT")" \
+"$(sanitize "$sid_value")" \
+"$(sanitize "$OS_SIMPLE")" \
+"${OUT_VER[$mp]:-unknown}" \
+"${OUT_IS_AUTOFS[$mp]:-unknown}" \
+"$(sanitize "$mp")" \
+"$(sanitize "$opts")" \
+"$(sanitize "${OUT_SOURCE[$mp]:--}")" \
+"$(sanitize "${OUT_NFS_SERVER[$mp]:-NA}")" \
+"$(sanitize "${OUT_FILE[$mp]:--}")" \
+"$(sanitize "${OUT_DF_BLOCKS[$mp]:--}")" \
+"$(sanitize "${OUT_DF_FREE[$mp]:--}")" \
+"$(sanitize "${OUT_DF_PERC_USED[$mp]:--}")" \
+"$(sanitize "${OUT_DF_IUSED[$mp]:--}")" \
+"$(sanitize "${OUT_DF_PERC_IUSED[$mp]:--}")"
+done
+
+TOTAL_EMITTED="$printed"
+if [ "$printed" -eq 0 ]; then
+# Placeholder row (maintains CSV shape for consumers)
+printf '%s;%s;%s;-;-;-;-;-;-\n' \
+"$(sanitize "$HOSTNAME_SHORT")" \
+"$(sanitize "$sid_value")" \
+"$(sanitize "$OS_SIMPLE")"
+TOTAL_EMITTED=1
+fi
+
+dbg "summary: total_emitted=${TOTAL_EMITTED}"
+dbg "===== EXIT ====="
+}
+
+# ===============================================================================
+# SECTION: Orchestration (main)
+# ===============================================================================
+
+# ------------------------------------------------------------------------------
+# Function : main
+# Purpose  : Execute the end-to-end scan pipeline in a clear, declarative order.
+# Inputs   : command-line flags (only -d handled here)
+# Outputs  : CSV to stdout; debug to stderr if -d
+# ------------------------------------------------------------------------------
+main() {
+dbg "===== ENTER ====="
+setup_env
+parse_master_files
+collect_autofs
+print_autofs_audit # emits only when -d; safe to keep in flow
+collect_active     # OS-dispatched active mount collection
+merge_autofs_only
+print_rows
+dbg "FINAL: master=${MASTER_ENTRIES} mapfiles=${MAPFILES_OPENED} autofs=${AUTOFS_ENTRIES} active=${ACTIVE_NFS} inactive=${INACTIVE_ADDED} emitted=${TOTAL_EMITTED}"
+dbg "===== EXIT ====="
+}
+
+main "$@"
